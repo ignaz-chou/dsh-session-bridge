@@ -80,6 +80,17 @@ function liveAgents(env: BridgeEnv): LiveAgentLike[] {
   return agents.list()
 }
 
+/** The UI archive set, treated as a routing exclusion rather than a visibility decoration. */
+function archivedSessionIds(env: BridgeEnv): ReadonlySet<string> {
+  return new Set((env.ctx.workspaceRegistry.archivedSessionIds ?? []).map(String))
+}
+
+/** Archived sessions stay readable, but routing verbs must refuse to target them. */
+function assertRoutable(env: BridgeEnv, sessionId: string, toolName: string): void {
+  if (!archivedSessionIds(env).has(sessionId)) return
+  throw new Error(toolName + ' refuses archived session ' + JSON.stringify(sessionId) + '. Unarchive it first.')
+}
+
 /** 等待结果里的状态附注行（wait / send / create 三处渲染共用）。 */
 function waitNotes(reply: Record<string, unknown>): string[] {
   const notes: string[] = []
@@ -247,6 +258,7 @@ function registerSend(env: BridgeEnv): void {
     async execute(args: SendArgs, exec) {
       if (typeof args.sessionId !== 'string' || args.sessionId.trim() === '') throw new Error('invalid sessionId: expected a non-empty string')
       if (typeof args.message !== 'string' || args.message.trim() === '') throw new Error('invalid message: expected a non-empty string')
+      assertRoutable(env, args.sessionId, 'session_bridge_send')
       const agent = liveAgent(env, args.sessionId)
       if (agent === undefined) {
         throw new Error('session ' + JSON.stringify(args.sessionId) + ' is not live — call session_bridge_resume first to bring it online (or session_bridge_find to locate it)')
@@ -298,6 +310,7 @@ function registerResume(env: BridgeEnv): void {
     },
     async execute(args: ResumeArgs) {
       if (typeof args.sessionId !== 'string' || args.sessionId.trim() === '') throw new Error('invalid sessionId: expected a non-empty string')
+      assertRoutable(env, args.sessionId, 'session_bridge_resume')
       const existing = liveAgent(env, args.sessionId)
       if (existing !== undefined) {
         env.registry.touch(args.sessionId)
@@ -594,13 +607,14 @@ interface FindArgs {
   workspaceId?: string
   cwd?: string
   liveOnly?: boolean
+  includeArchived?: boolean
   limit?: number
 }
 
 function registerFind(env: BridgeEnv): void {
   env.ctx.tools.register(defineTool({
     name: 'session_bridge_find',
-    description: 'Find sessions by name (title), session id, workspace, or directory — across ALL workspaces. Live agents are always current; persisted (offline) sessions come from the durable session store. A plain query matches session id / title / cwd as a case-insensitive substring. Offline titles are resolved lazily from the session log (bounded); bridge-registered titles (from session_bridge_create title) are matched as aliases and used as a fallback. Returns metadata + live/running state, ready to pass to create/send/resume/wait/read.',
+    description: 'Find sessions by name (title), session id, workspace, or directory — across ALL workspaces. Archived sessions are excluded by default; pass includeArchived=true to include them. Live agents are always current; persisted (offline) sessions come from the durable session store. A plain query matches session id / title / cwd as a case-insensitive substring. Offline titles are resolved lazily from the session log (bounded); bridge-registered titles (from session_bridge_create title) are matched as aliases and used as a fallback. Returns metadata + live/running state, ready to pass to create/send/resume/wait/read.',
     parameters: {
       query: { type: 'string', description: 'Substring matched against session id, title, and cwd (case-insensitive).' },
       sessionId: { type: 'string', description: 'Only sessions whose id contains this substring.' },
@@ -608,6 +622,7 @@ function registerFind(env: BridgeEnv): void {
       workspaceId: { type: 'string', description: 'Only sessions in this workspace id.' },
       cwd: { type: 'string', description: 'Only sessions whose cwd contains this substring (path or basename).' },
       liveOnly: { type: 'boolean', description: 'When true, only live sessions are returned (default false).' },
+      includeArchived: { type: 'boolean', description: 'When true, include archived sessions (default false).' },
       limit: { type: 'number', description: 'Maximum items (default 10, max 50).' },
     },
     output: {
@@ -628,6 +643,7 @@ function registerFind(env: BridgeEnv): void {
     },
     async execute(args: FindArgs) {
       const limit = clampLimit(args.limit, 10, 50)
+      const excludedArchived = args.includeArchived === true ? undefined : archivedSessionIds(env)
       const wsById = workspaceBySession(env.ctx)
       const items: BridgeFindItem[] = []
       for (const agent of liveAgents(env)) {
@@ -700,6 +716,7 @@ function registerFind(env: BridgeEnv): void {
         }
       }
       const filtered = items.filter((item) => {
+        if (excludedArchived?.has(item.sessionId) === true) return false
         if (idFilter !== '' && !item.sessionId.toLowerCase().includes(idFilter)) return false
         if (titleFilter !== '') {
           const titles = ((item.title ?? '') + ' ' + (bridgeTitles.get(item.sessionId) ?? '')).toLowerCase()
